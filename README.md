@@ -4,8 +4,6 @@
 
 **Processor Microarchitectural Side-Channel Vulnerability Testbed on AMD Platform (TJU 2026 Graduation Thesis)**
 
----
-
 ## 1. Project Introduction
 
 **Project Focus：**
