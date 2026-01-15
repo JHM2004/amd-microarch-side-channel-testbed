@@ -29,3 +29,4 @@
 
 ---
 
+基于 [Graf et al., S&P 2026](https://comsec.ethz.ch/vmscape/) 的研究成果

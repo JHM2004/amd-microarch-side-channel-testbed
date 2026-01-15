@@ -27,3 +27,4 @@ This project focuses on the security testing of processor microarchitecture side
 
 ---
 
+Based on research by [Graf et al., S&P 2026](https://comsec.ethz.ch/vmscape/)
