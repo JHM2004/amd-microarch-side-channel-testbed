@@ -27,6 +27,13 @@
 - 优先使用现成开源代码与数据采集工具，完成在AMD CPU平台上的配置与复现；
 - 实现至少两类测信道漏洞的可复现演示与基本对抗测试，输出量化结果与可视化图表。
 
+## 2. 代码仓库
+
+### FLUSH AND RELOAD
+项目地址：https://github.com/JHM2004/flush_and_reload  
+[![GitHub](https://img.shields.io/badge/GitHub-查看仓库-blue?style=flat&logo=github)](https://github.com/JHM2004/flush_and_reload)
+
+
 ---
 
 基于 [Graf et al., S&P 2026](https://comsec.ethz.ch/vmscape/) 的研究成果
