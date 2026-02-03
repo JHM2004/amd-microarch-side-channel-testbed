@@ -30,8 +30,7 @@
 ## 2. 代码仓库
 
 ### FLUSH AND RELOAD
-项目地址：https://github.com/JHM2004/flush_and_reload  
-[![GitHub](https://img.shields.io/badge/GitHub-查看仓库-blue?style=flat&logo=github)](https://github.com/JHM2004/flush_and_reload)
+项目地址：https://github.com/JHM2004/flush_and_reload 
 
 
 ---
