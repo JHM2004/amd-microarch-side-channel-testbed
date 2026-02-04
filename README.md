@@ -30,8 +30,3 @@
 ## 2. 代码仓库
 
 **2.1 FLUSH AND RELOAD** 项目地址：https://github.com/JHM2004/flush_and_reload 
-
-
----
-
-基于 [Graf et al., S&P 2026](https://comsec.ethz.ch/vmscape/) 的研究成果
