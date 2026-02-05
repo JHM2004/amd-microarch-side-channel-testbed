@@ -27,4 +27,4 @@ This project focuses on the security testing of processor microarchitecture side
 
 ## 2. Code Repository
 
-**2.1 FLUSH AND RELOAD** Project Address: https://github.com/JHM2004/flush_and_reload
+**2.1 FLUSH AND RELOAD** Code Repository: https://github.com/JHM2004/flush_and_reload
