@@ -53,6 +53,3 @@ dkms.conf
 
 # debug information files
 *.dwo
-
-# other
-/论文文献/other_large_pdf/
