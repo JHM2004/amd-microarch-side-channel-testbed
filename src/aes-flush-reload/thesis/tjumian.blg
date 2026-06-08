@@ -1,0 +1,17 @@
+[0] Config.pm:304> INFO - This is Biber 2.14 (beta)
+[0] Config.pm:307> INFO - Logfile is 'tjumian.blg'
+[78] biber:322> INFO - === 一 6月  1, 2026, 21:06:58
+[94] Biber.pm:415> INFO - Reading 'tjumian.bcf'
+[195] Biber.pm:943> INFO - Found 38 citekeys in bib section 0
+[218] Biber.pm:4256> INFO - Processing section 0
+[219] Utils.pm:75> INFO - Globbing data source 'reference.bib'
+[219] Utils.pm:91> INFO - Globbed data source 'reference.bib' to reference.bib
+[232] Biber.pm:4455> INFO - Looking for bibtex format file 'reference.bib' for section 0
+[237] bibtex.pm:1653> INFO - LaTeX decoding ...
+[280] bibtex.pm:1471> INFO - Found BibTeX data source 'reference.bib'
+[2262] UCollate.pm:68> INFO - Overriding locale 'en-US' defaults 'normalization = NFD' with 'normalization = prenormalized'
+[2262] UCollate.pm:68> INFO - Overriding locale 'en-US' defaults 'variable = shifted' with 'variable = non-ignorable'
+[2262] Biber.pm:4084> INFO - Sorting list 'none/global//global/global' of type 'entry' with template 'none' and locale 'en-US'
+[2263] Biber.pm:4090> INFO - No sort tailoring available for locale 'en-US'
+[2300] bbl.pm:652> INFO - Writing 'tjumian.bbl' with encoding 'UTF-8'
+[2348] bbl.pm:755> INFO - Output to tjumian.bbl

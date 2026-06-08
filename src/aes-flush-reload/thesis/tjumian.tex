@@ -1,0 +1,44 @@
+\documentclass[songnumber]{tjuthesis-Bachelor}
+
+\usepackage{tikz}
+\usetikzlibrary{shapes,arrows,positioning,fit,calc,decorations.pathreplacing}
+
+\graphicspath{{figures/}}
+
+\begin{document}
+
+\include{contents/introduction}
+
+\makecover
+
+% 独创性声明：使用外部PDF，不显示页眉页脚
+\includepdf[pagecommand={\thispagestyle{empty}}]{独创性声明.pdf}
+
+\frontmatter
+
+% 摘要页：无页眉，有页码
+\makeabstract
+
+% 目录页
+\pagestyle{noheader}
+\tableofcontents
+\pagestyle{plain}
+
+\mainmatter
+\input{contents/chapter1}
+
+\input{contents/chapter2}
+
+\input{contents/chapter3}
+
+\input{contents/chapter4}
+
+\input{contents/chapter5}
+
+\backmatter
+
+\printbibliography[heading=bibintoc]
+
+\input{contents/acknowledgements}
+
+\end{document}

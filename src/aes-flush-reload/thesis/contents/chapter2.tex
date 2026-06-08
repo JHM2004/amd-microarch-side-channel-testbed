@@ -1,0 +1,611 @@
+\chapter{相关技术背景}
+
+Flush+Reload攻击的运作需要多层机制协同支撑：CPU缓存管理机制、进程共享内存机制、高精度计时机制，以及AES的T表实现为何存在信息泄露。本章从硬件到软件，对每一层机制的原理逐一展开。
+
+\section{CPU缓存结构}
+
+\subsection{缓存层次结构}
+
+CPU运算速度远高于主存访问速度。以2020年代主流桌面处理器为例，CPU每个时钟周期能完成多条整数运算，一次主存访问却偶尔需要200到400个周期。这一速度差异是体系结构中不可避免的，缓存即为填补该差距的中间存储层。
+
+现代x86处理器普遍采用三级金字塔结构。
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.9\textwidth]{CPU多级缓存层次结构图.png}
+    \caption{现代x86处理器的三级缓存层次结构。每个核心拥有私有的L1指令/数据缓存和L2缓存，所有核心共享L3缓存。从L1到主存，容量递增但访问延迟也递增}
+    \label{fig:cache_hierarchy}
+\end{figure}
+
+L1容量32--64KB，延迟约4周期，分指令缓存（L1I）和数据缓存（L1D），一个核心独占。L2容量256KB--1MB，延迟约12周期，统一型缓存，同样每核心独占。L3——也叫末级缓存（Last-Level Cache， LLC）——容量从几MB到几十MB，延迟约40周期，所有核心共享。从L1到L3，容量递增但访问延迟也递增，本质上是以空间换取时间。
+
+多级缓存能奏效，依赖于程序的两个规律：空间局部性和时间局部性。空间局部性是指，程序访问了某个地址后，短期内大概率会访问附近的地址——数组遍历、指令顺序执行即为典型示例。时间局部性是指，刚被访问过的数据，短期内很可能再次被访问——循环变量、频繁调用的函数属于此类。
+
+缓存行（Cache Line）的设计直接服务于空间局部性：一次不只载入请求的那个字节，而是将相邻一整块数据一并载入。多级缓存层次则服务于时间局部性：刚使用过的数据留在L1，稍久未用的回退到L2或L3，再次需要时能快速找回。
+
+\subsection{缓存行与映射方式}
+
+缓存以固定大小的数据块作为管理和传输的基本单位，即缓存行（Cache Line）。x86处理器这一行是64字节。内存地址映射到缓存位置有三种策略。
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.85\textwidth]{缓存行与内存地址映射关系图.png}
+    \caption{内存地址到缓存行的映射方式对比。左图为直接映射，每个内存块只能映射到唯一缓存行；中图为全相联映射，内存块可放入任意缓存行；右图为组相联映射，内存块先按组号定位，再在组内选择}
+    \label{fig:cache_mapping}
+\end{figure}
+
+直接映射：每个内存块只能映射到缓存中唯一的一行。查找速度快，但冲突严重。两个频繁交替访问、又恰好被映射到同一行的内存块，会反复将对方驱逐——这就是所谓的"抖动"。
+
+全相联映射：内存块可以放入缓存中的任意一行。冲突最少，但查找需并行比较所有行标签，硬件成本高，仅适用于小容量缓存（如TLB）。
+
+组相联映射：将缓存划分为若干组（Set），内存块先按地址（组号）映射到固定组，然后在组内任选一行存放。$n$路组相联即每组有$n$行。$n$越大冲突越少，硬件也越复杂。主流处理器的L1一般为8路组相联，L3可达12--16路。
+
+\subsection{缓存替换策略}
+
+缓存组已满，但新数据需要载入，则需淘汰旧数据。替换策略决定淘汰哪一行。实际处理器中采用的主要有三种。
+
+LRU：淘汰最近最少使用的那行。理论上最优——它利用了时间局部性，认为最近未使用的短期内也不会再被访问。但严格的LRU需为每行维护访问时间戳或位序，路数增多时硬件开销增大。如16路组相联的L3，每组需维护16个条目的全序关系，实现代价较大。
+
+伪LRU（PLRU）：是LRU的近似，用一棵二叉树记录访问方向。以4路为例，3个二叉位即可表示4行的近似LRU顺序：每次访问沿路径翻转位值，替换时沿0方向选择。PLRU将硬件开销从LRU的$O(n \log n)$降至$O(n)$，8路、16路场景下是主流选择。许多Intel处理器的L2采用PLRU，而L3则部分采用类LRU策略（如PLRU）或自适应替换策略（如基于RRIP/DRRIP的动态插入策略）。
+
+随机替换：顾名思义，随机选一行淘汰。实现最简单，无需任何状态位。表面效果较差，但在工作集远大于缓存容量的场景下，随机替换的期望性能与LRU差距不大——冲突驱逐不可避免。部分ARM处理器的L1采用随机替换。
+
+LRU和PLRU的行为是确定性的。监听方可以通过精心构造的访问序列将目标数据驱逐到指定位置——Prime+Probe攻击即在此基础上发展而来。随机替换引入了不确定性，攻击难度增大，但从根本上消除侧信道风险是无法实现的，攻击者通过大量重复实验仍能统计出替换规律。
+
+\subsection{缓存寻址：虚拟索引与物理标签}
+
+缓存查找需用地址定位缓存行。此处有一个关键设计选择：索引和标签究竟使用虚拟地址还是物理地址。
+
+虚拟地址是CPU发出的地址，物理地址是内存芯片上的实际地址，两者通过页表转换。缓存在地址转换之前还是之后查找，决定了索引和标签的类型。
+
+VIPT（Virtual Index， Physical Tag）是当前x86处理器的主流方案。索引用虚拟地址低位，标签用物理地址高位。由于同一页内虚拟地址低位与物理地址低位相同（页内偏移不变），索引可以与地址转换并行计算，无需等待页表查找完成——缓存访问延迟因此缩短。L1和L2普遍采用VIPT。VIPT要求缓存容量不超过页大小乘以相联度。以4KB页、8路组相联为例，L1最多32KB，这也是L1容量通常定为32KB的原因。不过，现代x86处理器通过缓存分体或物理索引部分重叠等技术，可以在不产生别名问题的前提下突破这一硬上限，例如部分AMD处理器的64KB 4路L1采用微标签等方案仍能维持VIPT语义。
+
+PIPT（Physical Index， Physical Tag），索引和标签均使用物理地址，必须等待地址转换完成才能查询缓存。延迟增大，但不存在别名问题——不同虚拟地址映射到同一物理地址时，缓存中的行为是一致的。L3一般采用PIPT，因为L3容量大，不受VIPT的容量限制。
+
+VIVT（Virtual Index， Virtual Tag）索引和标签都用虚拟地址，查缓存不需要地址转换，延迟最低，但存在别名问题：同一物理地址可能通过不同虚拟地址映射进来，缓存中可能出现多个副本，导致一致性问题。现代x86处理器已基本不采用VIVT。
+
+L3使用物理地址索引，意味着监听方需要知道目标数据的物理地址才能精确操控缓存状态。不过在共享内存场景下，双方映射同一物理页面，虚拟地址的页内偏移与物理地址的页内偏移一致。监听方仍可准确定位目标缓存行。
+
+\subsection{包含性与非包含性缓存层次}
+
+多级缓存之间存在包含性关系。若L3存储了L1/L2中所有数据的副本，则称L3对L1/L2是包含的（Inclusive）。若L3可以不包含L1/L2的某些数据，则为非包含（Non-Inclusive）。若L3保证不包含L1/L2的数据，则为排他的（Exclusive）。
+
+Intel处理器早期多采用包含性L3，L3是L1/L2的超集。包含性简化了一致性协议，某个核心要修改数据时，仅需检查L3标签即可判断其他核心是否持有副本，无需逐个查询每个核心的L1/L2。需要注意的是，自Skylake起的部分Intel客户端处理器已转向非包含性L3设计，当前Intel产品线中包含性与非包含性方案并存。
+
+包含性L3还有一个重要特性：CLFLUSH指令触发一次全局的缓存一致性操作。执行该指令的CPU核心会向整个一致性域广播针对目标缓存行的无效化消息，所有核心的私有缓存（L1/L2）及共享缓存（如包含性L3）中的该行副本都会被置为I状态。若某核心持有M状态的脏数据，则会先写回主存再无效化。回顾Flush+Reload攻击，其正是依赖于该特性——CLFLUSH保证目标数据从整个缓存层次中移除，刷新后若重新访问延迟较大，则说明数据确实不在任何缓存级别中。
+
+AMD Zen架构的L3是非包含性的。CLFLUSH指令定义为全局逐出操作：无论缓存层次的包含策略如何，它都会将目标缓存行从整个缓存一致性域内的所有缓存级别（L1、L2、L3）中驱逐。在非包含性缓存上执行CLFLUSH时，硬件会通过缓存一致性协议（如MOESI）向所有核心广播无效化探听，不仅清除L3，也会清除任何核心的L1/L2副本。因此，CLFLUSH在非包含性缓存上依然保证全局逐出语义，Flush+Reload攻击仍然有效。不过，非包含性缓存层次中L1/L2可能持有L3中不存在的副本， Victim进程在L1/L2中的数据可能因调度等因素更快被替换，噪声可能略高于包含性缓存。
+
+\subsection{缓存一致性协议}
+
+多核芯片上每个核心都可能持有同一内存地址的副本，需要一套机制保证所有核心观测到的数据一致。Intel处理器采用MESI协议维护缓存一致性，为缓存行定义了四种状态：
+
+M（Modified，已修改）：本核修改了数据，与主存不一致。数据仅存在于本核缓存中。其他核心请求该数据时，本核必须将修改后的数据写回主存，或直接转发给请求方。
+
+E（Exclusive，独占）：缓存行数据与主存一致，且仅存在于本核缓存中。本核可直接修改——修改后状态转为M。
+
+S（Shared，共享）：数据与主存一致，可能在多个核心的缓存中同时存在副本。任一核心欲修改该行，需先通过总线通知其他核心将各自副本置为I。
+
+I（Invalid，无效）：该缓存行为空，访问该行一定触发缓存未命中。
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.8\textwidth]{MESI协议状态转换图.png}
+    \caption{MESI缓存一致性协议的状态转换图。M（Modified）表示已修改，E（Exclusive）表示独占，S（Shared）表示共享，I（Invalid）表示无效。箭头标注了触发状态转换的事件类型}
+    \label{fig:mesi_protocol}
+\end{figure}
+
+MESI协议通过总线上的监听（Snooping）机制运作：每个核心的缓存控制器监听总线上的事务，根据事务类型和本地缓存行的状态执行相应动作。状态转换的关键路径包括：核心读未命中且无其他核心持有该行时，从主存加载并标记为E；核心读未命中但其他核心持有S副本时，从主存加载并标记为S；核心写命中时，若状态为M或E直接写入并标记为M，若状态为S则先发出无效化请求（Invalidate），等其他核心将副本置为I后再写入并标记为M。
+
+\subsection{MESI协议如何使跨核攻击成为可能}
+
+MESI协议的跨核无效化机制是Flush+Reload攻击的协议基础。考虑以下场景：监听方运行于核心0，被攻击方运行于核心1。
+
+监听方用CLFLUSH将目标缓存行从所有缓存级别驱逐，该行在两个核心的缓存中均变为I状态。之后若被攻击方（核心1）访问了该地址，缓存控制器会从主存或L3将数据载入核心1的缓存，该行在核心1变为E或S状态。若L3是包含性的，同一行也会出现在L3中。监听方（核心0）随后重新访问该地址，即可发现该行已在L3中（状态为S），访问延迟远低于从主存加载——此即缓存命中。反之，若被攻击方未访问该地址，该行仍不在任何缓存中，监听方的访问需通过主存完成，延迟显著增大。
+
+监听方从未与被攻击方直接通信，也没有突破任何权限隔离。其仅测量了自身访问共享内存的时间。但MESI协议保证了一点：被攻击方对共享数据的访问会改变缓存状态，缓存状态的变化可通过时间差被观测到。这就是跨核侧信道攻击的原理。
+
+\subsection{缓存访问时间差异}
+
+缓存命中和未命中的延迟差异显著。以Intel Core i5-1135G7为例：L1D命中约5周期（约2.1ns@2.4GHz），L2命中约14周期（约5.8ns），L3命中约50周期（约20.8ns），主存访问约300周期（约125ns）。命中与未命中之间存在100到300周期的稳定差距。Flush+Reload攻击即将该时间差距作为观测信号。
+
+\section{共享内存机制}
+
+\subsection{共享内存概述}
+
+共享内存使多个进程可访问同一块物理内存。它是高效的IPC机制——数据无需在内核缓冲区和用户缓冲区之间反复拷贝，进程直接读写映射到自身地址空间的内存页即可。Linux支持三种共享内存方式：System V（shmget/shmat）、POSIX（shm\_open/mmap）、内存映射文件（open/mmap）。
+
+\subsection{POSIX共享内存API}
+
+POSIX共享内存是本文采用的机制，核心API包括：
+
+shm\_open()创建或打开一个共享内存对象，参数包括名称、标志位（O\_RDWR等）和权限模式，返回一个文件描述符。名称以斜杠开头（如"/aes\_ttables"），在同一系统内全局可见。
+
+ftruncate()设置共享内存对象的大小。新创建的共享内存对象初始大小为0，必须通过ftruncate扩展到所需容量。
+
+mmap()将共享内存对象映射到进程的虚拟地址空间，返回映射区域的起始地址。关键参数包括：保护模式（PROT\_READ | PROT\_WRITE）、映射标志（MAP\_SHARED表示修改对其他进程可见）、文件描述符和偏移量。映射完成后，进程可以像操作普通内存一样读写共享区域。
+
+shm\_unlink()删除共享内存对象的名称。名称删除后，已经映射的进程仍可继续访问，但新的shm\_open无法再找到该对象。当所有映射都解除后，共享内存对象自动销毁。
+
+本文的方案是：攻击者进程用shm\_open打开共享内存对象，mmap将T表数据映射到自身地址空间；受害者进程同样用shm\_open和mmap映射同一块共享内存。两个进程的虚拟地址不同，但底层指向同一块物理内存。
+
+\subsection{写时复制与代码段共享}
+
+Linux的fork()采用写时复制（Copy-on-Write， CoW）机制：子进程创建时不立即复制父进程的内存页，而是让父子共享同一物理页，并全部标记为只读。任一方先写入时，CPU触发页故障，内核此时才复制该页、修改页表使写方指向新物理页。CoW大幅降低了fork的开销，也带来一个值得注意的问题——fork后的父子进程在写入前共享物理内存，这本身就构成侧信道风险。
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.85\textwidth]{共享内存与写时复制机制图.jpg}
+    \caption{共享内存与写时复制（CoW）机制示意图。左图展示fork后父子进程初始共享物理页面；右图展示任一方执行写操作时触发页故障，操作系统为写方创建独立副本的过程}
+    \label{fig:cow_mechanism}
+\end{figure}
+
+动态链接库的代码段是共享内存的另一个典型场景，且不受CoW影响。多个进程加载同一个动态库，操作系统只需将库代码载入物理内存一次，所有进程共享同一份物理映射。代码段被标记为只读（PROT\_READ | PROT\_EXEC），写操作直接触发段错误而非CoW。这意味着代码段的物理页永远不会被复制，始终为所有进程共享的同一份。
+
+此处需注意，这为Flush+Reload探测提供了有利条件——监听方可以加载与被攻击方相同的动态库，监视被攻击方对库代码的访问模式，无需考虑CoW机制导致物理页分离。
+
+数据段则不同。若被攻击方修改了数据段中的变量，CoW机制将创建物理页副本，双方从此访问不同物理页，缓存侧信道攻击即失效。因此Flush+Reload一般选择监视只读的代码段，或显式创建的共享内存区域。
+
+\subsection{虚拟化环境中的内存去重}
+
+共享内存在虚拟化场景下有更广泛的存在形式。云平台上的不同虚拟机运行于同一台物理主机上，通过Hypervisor管理物理内存分配。为了提升内存利用率，Hypervisor开启KSM（Kernel Same-page Merging）：定期扫描各个虚拟机的内存页，找出内容相同的页面，将它们合并为同一物理页的映射，标记为CoW。若某台虚拟机修改了该合并页面，CoW机制再创建独立副本。
+
+KSM在云环境中带来了显著的内存节省，但也引入了严重的安全风险。不同租户的虚拟机可能装载相同的OS内核、相同的库文件——KSM将这些页面合并后，不同虚拟机的物理页即实现了共享。攻击者虚拟机可以借助该共享关系，对同宿主机上的其他租户虚拟机发起跨VM的Flush+Reload探测。Zhang等人在PaaS云环境中验证了该攻击的可行性，成功跨租户恢复了AES密钥。
+
+内存去重是KSM的推广概念，不仅合并相同页面，还可能合并部分相同的页面。Windows和ESXi也有类似的去重机制。
+
+安全问题明确：内存去重将共享内存的攻击面放大了。两个进程即使没有显式建立共享内存，只要恰好存在内容相同的内存页，去重机制便隐式建立了共享关系。Benger等人的研究表明，即使仅有少量共享页面，也足以支撑高精度的缓存侧信道攻击。
+
+\section{时间测量方法}
+
+\subsection{时间戳计数器}
+
+x86处理器提供高精度时间戳计数器，通过RDTSC/RDTSCP指令读取。TSC以固定频率递增，每个时钟周期加1，提供纳秒级的时间分辨率。实际攻击中用的时间测量核心代码：
+
+\begin{verbatim}
+static inline uint64_t rdtsc() {
+    uint64_t a, d;
+    asm volatile ("rdtsc" : "=a" (a), "=d" (d));
+    return (d << 32) | a;
+}
+static inline void flush_cache_line(const void *addr) {
+    asm volatile ("clflush 0(%0)" :: "r" (addr) : "memory");
+}
+\end{verbatim}
+
+\subsection{RDTSC与RDTSCP的区别}
+
+RDTSC和RDTSCP都读取TSC，但行为上有一个关键差别。RDTSC不是串行化指令，处理器可以在RDTSC前后重排其他指令——这样读取的时间戳便无法精确反映RDTSC前后代码的实际执行时间。例如处理器可能将RDTSC之后的访存指令提前执行，测出的时间就会偏短。实际中常在RDTSC前后插入LFENCE指令来阻止这种重排。
+
+RDTSCP是部分串行化：它保证RDTSCP之前的指令全部执行完毕后才读取TSC，但之后的指令仍可能被提前执行。因此RDTSCP之后加一条LFENCE即可实现完整序列化，比RDTSC+双LFENCE效率更高。需要注意的是，LFENCE在Intel上是序列化屏障，在较老的AMD处理器上行为可能不同，攻击代码通常需要考虑平台差异。在Flush+Reload攻击里，RDTSCP是首选的时间测量指令。
+
+另外，现代Intel处理器支持恒定TSC（Invariant TSC），TSC频率不随CPU动态调频变化。这在Nehalem及之后的架构上是默认行为，保证了时间测量在不同频率下的一致性。若TSC不恒定，CPU降频时TSC频率降低，测量的周期数偏大，阈值将直接失效。
+
+\subsection{用户态时间测量的精度问题}
+
+在用户态进行高精度时间测量会面临多种干扰因素。
+
+上下文切换是最大的干扰源。OS调度器可能在中断、时间片耗尽、系统调用等时刻将当前进程换出。一次上下文切换耗时数千至数万周期，远超缓存命中与未命中的时间差。测量过程中若进程被切换，测得的时间便混入了调度开销，无法反映真实的缓存访问延迟。
+
+中断同样棘手。硬件中断——定时器、网络、键盘等——可在任意时刻打断当前进程，处理完毕后才恢复执行。中断处理的时间虽短于上下文切换，但也在数百至数千周期量级，足以干扰时间测量。
+
+预取是硬件层面的适得其反。硬件预取器发现顺序访问模式时，会提前将后续缓存行载入缓存。若预取器恰好将探测方即将测量的缓存行载入，本应"未命中"的测量便变为"命中"——假阳性噪声由此产生。
+
+如何应对上述干扰？
+
+绑定CPU核心可以防止进程迁移导致的缓存冷启动，这是用户态最容易实现的。关闭中断需要内核权限，用户态无法实现。设置实时调度策略能减少调度干扰，同样受权限限制。重复测量取统计量——用中位数而非均值来消除异常值的影响——是数据层面的补救。本文采用的方法是核心绑定加统计滤波，在用户态条件下尽可能提高测量精度。唐博文等人对时间侧信道的攻防技术做过全面综述，梳理了不同防御机制的保护能力和性能瓶颈。
+
+\subsection{时间阈值确定}
+
+区分缓存命中和未命中需要一个时间阈值。本文采用中位数方法：分别测量缓存命中和未命中时间的中位数$M_{hit}$和$M_{miss}$，取$T = (M_{hit} + M_{miss}) / 2$作为阈值。典型值$M_{hit} \approx 80$周期，$M_{miss} \approx 300$周期，$T \approx 190$周期。
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.85\textwidth]{缓存命中与未命中时间分布直方图.png}
+    \caption{缓存命中与未命中的访问时间分布对比。左峰为缓存命中时间分布（低延迟），右峰为未命中时间分布（高延迟），两者之间存在明显的双峰特征。中间虚线标注分类阈值T，用于区分两种状态}
+    \label{fig:timing_distribution}
+\end{figure}
+
+为何采用中位数？缓存时间测量中异常值过多。上下文切换可使某次测量增至数万周期，硬件预取可使某次未命中测量异常偏小。均值对异常值极度敏感——一个极端异常值即可使均值产生偏差，导致阈值不准确。中位数则不同：只要异常值不超过样本量的一半，中位数基本不受影响。缓存时间测量场景下，异常样本通常占总样本的5\%到15\%，远低于50\%的临界点，中位数方法更为稳健。
+
+校准过程：首先对共享内存中的目标地址执行一次访问，确保数据在缓存中，然后连续测量10000次命中时间；接着用CLFLUSH驱逐缓存行，连续测量10000次未命中时间；分别计算两组数据的中位数，取平均值作为阈值。整个校准过程在攻击开始前执行。
+
+\section{AES加密算法原理}
+
+\subsection{AES算法概述}
+
+高级加密标准（Advanced Encryption Standard， AES）是由Rijndael算法演化而来的对称分组加密算法，2001年由NIST正式发布为FIPS PUB 197。AES支持128位、192位、256位三种密钥长度，对应加密轮数10、12、14轮，分组长度固定128位。AES的安全性依赖两条设计原则：混淆（Confusion）——使密文与密钥之间的统计关系尽可能复杂；扩散（Diffusion）——使明文的每一位影响密文的尽可能多位。
+
+\subsection{AES数学基础}
+
+AES的运算在有限域$GF(2^8)$上进行。有限域（也称伽罗瓦域）是包含有限个元素的代数结构，支持加法、减法、乘法和除法（除0外）四种运算，且满足交换律、结合律和分配律。$GF(2^8)$包含256个元素，每个元素可以表示为一个字节（8位），也可以表示为系数在$GF(2)$（即$\{0,1\}$，加法为异或）上的7次多项式：
+
+\begin{equation}
+a(x) = a_7x^7 + a_6x^6 + a_5x^5 + a_4x^4 + a_3x^3 + a_2x^2 + a_1x + a_0
+\end{equation}
+
+例如，字节0x57对应多项式$x^6 + x^4 + x^2 + x + 1$，字节0x83对应多项式$x^7 + x + 1$。
+
+$GF(2^8)$上的加法就是系数按位异或。例如$0x57 \oplus 0x83 = 0xD4$，对应多项式加法$(x^6 + x^4 + x^2 + x + 1) + (x^7 + x + 1) = x^7 + x^6 + x^4 + x^2$，系数模2后无进位。
+
+乘法是多项式乘法模不可约多项式$m(x) = x^8 + x^4 + x^3 + x + 1$（即0x11B）。不可约多项式的作用类似于素数——它不能在$GF(2)$上分解为更低次多项式的乘积，保证了$GF(2^8)$中每个非零元素都有乘法逆元。乘法运算的步骤：先将两个多项式按普通多项式乘法相乘（系数模2），然后对$m(x)$取模（即多项式除法取余数）。例如$0x57 \times 0x83$：
+
+先算$0x57 \times 0x02 = 0xAE$（左移1位），$0x57 \times 0x80 = 0x57$左移7位，需要多次模$m(x)$约化。实际计算中，乘以$x$（即0x02）是最常用的基本操作，称为xtime：
+
+\begin{equation}
+xtime(a) = \begin{cases} a \ll 1 & \text{if } a_7 = 0 \\ (a \ll 1) \oplus 0x1B & \text{if } a_7 = 1 \end{cases}
+\end{equation}
+
+当$a$的最高位为0时，左移1位不会溢出字节范围；当最高位为1时，左移后产生$x^8$项，需要异或0x1B（即$m(x)$去掉$x^8$项后的低8位）来约化。任意乘法都可以分解为若干次xtime和异或。例如$0x57 \times 0x13 = 0x57 \times (0x01 \oplus 0x02 \oplus 0x10) = 0x57 \oplus xtime(0x57) \oplus xtime^4(0x57)$。
+
+\subsection{AES状态矩阵}
+
+AES把128位输入排成$4 \times 4$的字节矩阵，按列优先顺序填充：
+
+\begin{equation}
+State = \begin{pmatrix} b_0 & b_4 & b_8 & b_{12} \\ b_1 & b_5 & b_9 & b_{13} \\ b_2 & b_6 & b_{10} & b_{14} \\ b_3 & b_7 & b_{11} & b_{15} \end{pmatrix}
+\end{equation}
+
+其中$b_0$是输入的第一个字节，$b_{15}$是最后一个字节。状态矩阵的每一列对应一个32位字，加密操作在状态矩阵上逐字节或逐列进行。
+
+\subsection{AES轮函数}
+
+AES加密由一个初始轮密钥加、若干标准轮和一个最终轮组成。标准轮包含SubBytes、ShiftRows、MixColumns、AddRoundKey四个操作，最终轮没有MixColumns。初始轮密钥加将明文与第一个轮密钥异或，为后续轮变换提供密钥依赖的输入。
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.95\textwidth]{AES加密算法整体流程图.png}
+    \caption{AES加密算法的整体流程图。从明文出发，先经过初始轮密钥加（AddRoundKey），然后执行$N_r-1$次标准轮（每轮包含SubBytes、ShiftRows、MixColumns、AddRoundKey四个操作），最后执行不含MixColumns的最终轮得到密文}
+    \label{fig:aes_encryption_flow}
+\end{figure}
+
+SubBytes变换。SubBytes用S盒对状态矩阵逐字节做非线性替换，这是AES中唯一的非线性操作。S盒的构造分两阶段：先在$GF(2^8)$上求输入字节的乘法逆元（0映射到0），再对结果做仿射变换：
+
+\begin{equation}
+S[x] = A \cdot (x^{-1} \mod m(x)) + b
+\end{equation}
+
+其中$A$是$GF(2)$上的$8 \times 8$可逆矩阵，$b = (1, 1, 0, 0, 0, 1, 1, 0)^T$。该构造同时满足了两个需求：求逆提供了非线性，仿射变换打乱了代数结构。其结果是差分分析和线性分析均难以奏效。S盒的256个值是固定的，可以预计算为查找表。例如$S[0x00] = 0x63$，$S[0x01] = 0x7C$，$S[0x53] = 0xED$，$S[0xFF] = 0x16$。
+
+ShiftRows变换。ShiftRows对状态矩阵的行做循环左移，行号就是移位量：第0行不移，第1行移1字节，第2行移2字节，第3行移3字节：
+
+\begin{figure}[htbp]
+    \centering
+    \begin{tikzpicture}[
+        cell/.style={rectangle, draw, minimum width=1cm, minimum height=0.7cm, align=center, font=\footnotesize},
+        arrow/.style={->,thick,>=stealth,blue!70}
+    ]
+    % Original state
+    \node[font=\small\bfseries] at (2,2.8) {ShiftRows前};
+    \foreach \i/\j/\val in {0/0/$s_{0,0}$, 0/1/$s_{0,1}$, 0/2/$s_{0,2}$, 0/3/$s_{0,3}$,
+                             1/0/$s_{1,0}$, 1/1/$s_{1,1}$, 1/2/$s_{1,2}$, 1/3/$s_{1,3}$,
+                             2/0/$s_{2,0}$, 2/1/$s_{2,1}$, 2/2/$s_{2,2}$, 2/3/$s_{2,3}$,
+                             3/0/$s_{3,0}$, 3/1/$s_{3,1}$, 3/2/$s_{3,2}$, 3/3/$s_{3,3}$} {
+        \node[cell] (a\i\j) at (\j*1.1, -\i*0.8+2) {\val};
+    }
+
+    % Arrow
+    \draw[arrow,very thick] (4.2,0.8) -- node[above,font=\footnotesize]{ShiftRows} (5.8,0.8);
+
+    % After ShiftRows
+    \node[font=\small\bfseries] at (8.5,2.8) {ShiftRows后};
+    \foreach \j/\val in {0/$s_{0,0}$, 1/$s_{0,1}$, 2/$s_{0,2}$, 3/$s_{0,3}$} {
+        \node[cell,fill=blue!10] (b0\j) at (\j*1.1+6.6, 2) {\val};
+    }
+    \foreach \j/\val in {0/$s_{1,1}$, 1/$s_{1,2}$, 2/$s_{1,3}$, 3/$s_{1,0}$} {
+        \node[cell,fill=green!10] (b1\j) at (\j*1.1+6.6, 1.2) {\val};
+    }
+    \foreach \j/\val in {0/$s_{2,2}$, 1/$s_{2,3}$, 2/$s_{2,0}$, 3/$s_{2,1}$} {
+        \node[cell,fill=orange!10] (b2\j) at (\j*1.1+6.6, 0.4) {\val};
+    }
+    \foreach \j/\val in {0/$s_{3,3}$, 1/$s_{3,0}$, 2/$s_{3,1}$, 3/$s_{3,2}$} {
+        \node[cell,fill=red!10] (b3\j) at (\j*1.1+6.6, -0.4) {\val};
+    }
+
+    % Row shift annotations
+    \node[font=\tiny,text=blue!70] at (12.2,2) {第0行：不移位};
+    \node[font=\tiny,text=green!60!black] at (12.2,1.2) {第1行：左移1};
+    \node[font=\tiny,text=orange!70!black] at (12.2,0.4) {第2行：左移2};
+    \node[font=\tiny,text=red!70!black] at (12.2,-0.4) {第3行：左移3};
+    \end{tikzpicture}
+    \caption{AES ShiftRows变换示意图。状态矩阵的每一行按行号进行循环左移：第0行不移位，第1行左移1字节，第2行左移2字节，第3行左移3字节。不同颜色标注各行位移量}
+    \label{fig:shiftrows}
+\end{figure}
+
+\begin{equation}
+\begin{pmatrix} s_{0,0} & s_{0,1} & s_{0,2} & s_{0,3} \\ s_{1,1} & s_{1,2} & s_{1,3} & s_{1,0} \\ s_{2,2} & s_{2,3} & s_{2,0} & s_{2,1} \\ s_{3,3} & s_{3,0} & s_{3,1} & s_{3,2} \end{pmatrix}
+\end{equation}
+
+ShiftRows的作用是列间扩散：将同一列的字节分散到不同列中，使MixColumns能够跨列混合数据。若缺少ShiftRows，每列的MixColumns仅影响本列，攻击者可以逐列独立分析。
+
+MixColumns变换。MixColumns对状态矩阵的每一列做$GF(2^8)$上的矩阵乘法，使用固定矩阵：
+
+\begin{equation}
+\begin{pmatrix} s'_{0,j} \\ s'_{1,j} \\ s'_{2,j} \\ s'_{3,j} \end{pmatrix} = \begin{pmatrix} 0x02 & 0x03 & 0x01 & 0x01 \\ 0x01 & 0x02 & 0x03 & 0x01 \\ 0x01 & 0x01 & 0x02 & 0x03 \\ 0x03 & 0x01 & 0x01 & 0x02 \end{pmatrix} \begin{pmatrix} s_{0,j} \\ s_{1,j} \\ s_{2,j} \\ s_{3,j} \end{pmatrix}
+\end{equation}
+
+矩阵中的乘法在$GF(2^8)$上进行，加法为异或。系数0x01、0x02、0x03分别对应乘1、乘$x$、乘$(x+1)$。这个矩阵是MDS（Maximum Distance Separable）矩阵，保证了扩散的最优性——输入中任意改变1个字节，输出中至少改变4个字节。
+
+AddRoundKey变换。AddRoundKey将状态矩阵与当前轮密钥逐字节异或：
+
+\begin{equation}
+s'_{i,j} = s_{i,j} \oplus k_{i,j}
+\end{equation}
+
+这是轮函数中唯一引入密钥信息的步骤。异或运算的可逆性保证了解密时只需再次异或同一轮密钥即可恢复原始状态。
+
+\subsection{AES一轮运算示例}
+
+以一个简化的例子说明一轮AES运算的过程。设某轮输入状态矩阵的第0列为$(0xDB, 0x13, 0x53, 0x22)^T$，轮密钥第0列为$(0xA0, 0xE0, 0xC0, 0xF0)^T$。
+
+SubBytes：查S盒替换每个字节。$S[0xDB] = 0xB9$，$S[0x13] = 0x7D$，$S[0x53] = 0xED$，$S[0x22] = 0x93$。替换后第0列变为$(0xB9, 0x7D, 0xED, 0x93)^T$。
+
+ShiftRows：第0行不移位，第0列的第0行字节0xB9位置不变。但第1行左移1字节，原来第1列的字节移到第0列；第2行左移2字节，原来第2列的字节移到第0列；第3行左移3字节，原来第3列的字节移到第0列。因此ShiftRows后第0列的4个字节来自不同原始列。
+
+MixColumns：对ShiftRows后的第0列做矩阵乘法。设ShiftRows后第0列为$(s_0, s_1, s_2, s_3)^T$，则：
+
+\begin{equation}
+s'_0 = 0x02 \cdot s_0 \oplus 0x03 \cdot s_1 \oplus s_2 \oplus s_3
+\end{equation}
+
+其中$0x02 \cdot s_0 = xtime(s_0)$，$0x03 \cdot s_1 = xtime(s_1) \oplus s_1$。
+
+AddRoundKey：将MixColumns的输出与轮密钥异或，$s''_0 = s'_0 \oplus 0xA0$，以此类推。
+
+这个例子展示了一轮运算中数据如何经过非线性S盒替换、行位移、列混淆和轮密钥加四个步骤的逐层变换。
+
+\subsection{AES密钥扩展}
+
+密钥扩展把初始密钥分成$N_k$个32位字（$N_k = 4/6/8$对应AES-128/192/256），递归生成后续字：
+
+\begin{figure}[htbp]
+    \centering
+    \begin{tikzpicture}[
+        word/.style={rectangle, draw, thick, minimum width=1.2cm, minimum height=0.6cm, align=center, font=\footnotesize},
+        op/.style={rectangle, draw, thick, rounded corners, fill=blue!15, minimum width=1.6cm, minimum height=0.5cm, align=center, font=\footnotesize},
+        arrow/.style={->,thick,>=stealth},
+        xor/.style={circle, draw, thick, inner sep=0pt, minimum size=5mm, font=\footnotesize}
+    ]
+    % Key words
+    \node[word,fill=yellow!20] (w0) at (0,0) {$w_0$};
+    \node[word,fill=yellow!20] (w1) at (1.5,0) {$w_1$};
+    \node[word,fill=yellow!20] (w2) at (3,0) {$w_2$};
+    \node[word,fill=yellow!20] (w3) at (4.5,0) {$w_3$};
+    \node[font=\footnotesize] at (2.25,0.6) {初始密钥（AES-128）};
+
+    % Generated words
+    \node[word,fill=green!15] (w4) at (6.5,0) {$w_4$};
+    \node[word,fill=green!15] (w5) at (8,0) {$w_5$};
+    \node[word,fill=green!15] (w6) at (9.5,0) {$w_6$};
+    \node[word,fill=green!15] (w7) at (11,0) {$w_7$};
+    \node[font=\footnotesize] at (8.75,0.6) {第1组轮密钥};
+
+    % Operations for w4
+    \node[op] (rot) at (4.5,-1.5) {RotWord};
+    \node[op] (sub) at (4.5,-2.5) {SubWord};
+    \node[op] (rcon) at (6.5,-2.5) {$\oplus$ Rcon};
+
+    \node[xor] (xor1) at (6.5,-1.5) {$\oplus$};
+
+    \draw[arrow] (w3) -- (rot);
+    \draw[arrow] (rot) -- (sub);
+    \draw[arrow] (sub) -- (rcon);
+    \draw[arrow] (rcon) -- (xor1);
+    \draw[arrow] (w0.south) -- ++(0,-0.5) -| (xor1);
+    \draw[arrow] (xor1) -- (w4);
+
+    % Operations for w5
+    \node[xor] (xor2) at (8,-1.5) {$\oplus$};
+    \draw[arrow] (w1.south) -- ++(0,-0.3) -| (xor2);
+    \draw[arrow] (w4.south) -- ++(0,-0.3) -| (xor2);
+    \draw[arrow] (xor2) -- (w5);
+
+    % Dots
+    \node at (12.5,0) {$\cdots$};
+
+    % Legend
+    \node[word,fill=yellow!20,minimum width=0.8cm,minimum height=0.4cm,font=\tiny] at (2,-3.5) {};
+    \node[font=\tiny,anchor=west] at (2.6,-3.5) {初始密钥字};
+    \node[word,fill=green!15,minimum width=0.8cm,minimum height=0.4cm,font=\tiny] at (5,-3.5) {};
+    \node[font=\tiny,anchor=west] at (5.6,-3.5) {扩展密钥字};
+    \node[op,minimum width=0.8cm,minimum height=0.4cm,font=\tiny] at (8,-3.5) {};
+    \node[font=\tiny,anchor=west] at (8.6,-3.5) {变换操作};
+    \end{tikzpicture}
+    \caption{AES-128密钥扩展流程示意图。初始密钥的4个字$w_0$--$w_3$通过RotWord、SubWord和Rcon变换递归生成后续字。当$i \bmod 4 = 0$时，$w_i = w_{i-4} \oplus SubWord(RotWord(w_{i-1})) \oplus Rcon[i/4]$；否则$w_i = w_{i-4} \oplus w_{i-1}$}
+    \label{fig:key_expansion}
+\end{figure}
+
+\begin{equation}
+w_i = \begin{cases} k_i & \text{if } i < N_k \\ w_{i-N_k} \oplus SubWord(RotWord(w_{i-1})) \oplus Rcon[i/N_k] & \text{if } i \geq N_k \text{ and } i \mod N_k = 0 \\ w_{i-N_k} \oplus SubWord(w_{i-1}) & \text{if } N_k > 6 \text{ and } i \mod N_k = 4 \\ w_{i-N_k} \oplus w_{i-1} & \text{otherwise} \end{cases}
+\end{equation}
+
+其中$RotWord$将32位字循环左移一个字节：$(a_0, a_1, a_2, a_3) \rightarrow (a_1, a_2, a_3, a_0)$。$SubWord$对32位字的每个字节分别做S盒替换。$Rcon[r]$是轮常量，其第一个字节为$x^{r-1}$在$GF(2^8)$上的值（$Rcon[1] = 0x01000000$，$Rcon[2] = 0x02000000$，$Rcon[3] = 0x04000000$，...），其余三个字节为0。
+
+对AES-128（$N_k = 4$），初始密钥产生$w_0$，$w_1$，$w_2$，$w_3$，然后每4个字为一组扩展。当$i \mod 4 = 0$时，$w_i = w_{i-4} \oplus SubWord(RotWord(w_{i-1})) \oplus Rcon[i/4]$；否则$w_i = w_{i-4} \oplus w_{i-1}$。总共生成44个字（11组，对应初始轮密钥加和10轮加密）。
+
+对AES-192（$N_k = 6$），初始密钥产生$w_0$，$...$，$w_5$，每6个字为一组扩展。当$i \mod 6 = 0$时使用$SubWord(RotWord(\cdot))$和$Rcon$分支；否则$w_i = w_{i-6} \oplus w_{i-1}$。总共生成52个字（对应12轮加密）。
+
+对AES-256（$N_k = 8$），初始密钥产生$w_0$，$...$，$w_7$，每8个字为一组扩展。当$i \mod 8 = 0$时使用$SubWord(RotWord(\cdot))$和$Rcon$分支；当$i \mod 8 = 4$时另有特殊分支：
+
+\begin{equation}
+w_i = w_{i-8} \oplus SubWord(w_{i-1})
+\end{equation}
+
+该额外分支增加了AES-256密钥扩展的非线性度，是AES-256相对于AES-128的一个安全增强，但也使得其密钥扩展过程并非处处均匀。总共生成60个字（对应14轮加密）。
+
+密钥扩展的这一特性，使攻击者可以通过恢复最后一轮密钥逆向推出原始密钥。以AES-128为例，恢复$K_{10}$（即$w_{40}$，$w_{41}$，$w_{42}$，$w_{43}$）后，利用$w_{i-4} = w_i \oplus w_{i-1}$（$i \mod 4 \neq 0$时）或$w_{i-4} = w_i \oplus SubWord(RotWord(w_{i-1})) \oplus Rcon[i/4]$（$i \mod 4 = 0$时）逐步逆推到$w_0$，$w_1$，$w_2$，$w_3$，即原始密钥$K_0$。
+
+\subsection{AES T表实现}
+
+T表将SubBytes、ShiftRows和MixColumns三个操作合并为预计算查找表。利用该优化后，一轮加密中每个输出字节的计算从4次S盒查表+4次域乘法+1次移位重排，简化为4次T表查表和3次异或操作。四个T表的定义：
+
+\begin{align}
+T_0[x] &= \begin{pmatrix} S[x] \cdot 0x02 \\ S[x] \\ S[x] \\ S[x] \cdot 0x03 \end{pmatrix}, & T_1[x] &= \begin{pmatrix} S[x] \cdot 0x03 \\ S[x] \cdot 0x02 \\ S[x] \\ S[x] \end{pmatrix} \\
+T_2[x] &= \begin{pmatrix} S[x] \\ S[x] \cdot 0x03 \\ S[x] \cdot 0x02 \\ S[x] \end{pmatrix}, & T_3[x] &= \begin{pmatrix} S[x] \\ S[x] \\ S[x] \cdot 0x03 \\ S[x] \cdot 0x02 \end{pmatrix}
+\end{align}
+
+每个$T_i[x]$是一个32位值，由S盒输出$S[x]$乘以MixColumns矩阵的第$i$列系数得到。$T_0$对应MixColumns矩阵的第0列，$T_1$对应第1列，依此类推。ShiftRows的字节重排通过选择不同的T表来实现——第$i$行字节统一查$T_i$表，ShiftRows的行偏移则体现在输入字节的列索引上（第$i$行取列$j+i \bmod 4$的字节）。
+
+采用T表后，一轮加密可以写成：
+
+\begin{equation}
+\begin{pmatrix} s'_{0,j} \\ s'_{1,j} \\ s'_{2,j} \\ s'_{3,j} \end{pmatrix} = T_0[s_{0,j}] \oplus T_1[s_{1,j+1}] \oplus T_2[s_{2,j+2}] \oplus T_3[s_{3,j+3}] \oplus k_j
+\end{equation}
+
+换言之，每轮4次S盒查表+4次MixColumns矩阵乘法+1次ShiftRows重排+1次AddRoundKey，被合并成了16次T表查表+12次32位异或+4次轮密钥异或。这种查表驱动的实现在软件中远快于逐字节做域运算，但代价也很明确：T表访问模式依赖于密钥相关的索引值，攻击者可以通过观测缓存状态推断索引信息。
+
+\subsection{T表与缓存行的映射关系}
+
+每个T表含256个32位入口，共1024字节。一个T表共256项，索引为\texttt{0x00}到\texttt{0xFF}。一个缓存行（64字节）可以存放16个4字节的表项。因此，索引\texttt{0x00}--\texttt{0x0F}在第0缓存行，\texttt{0x10}--\texttt{0x1F}在第1缓存行，以此类推，共16个缓存行。对于64字节的缓存行，每个缓存行存16个入口（$16 \times 4 = 64$字节），T表索引的高4位决定缓存行位置：
+
+\begin{figure}[htbp]
+    \centering
+    \begin{tikzpicture}[
+        entry/.style={rectangle, draw, minimum width=0.55cm, minimum height=0.45cm, align=center, font=\tiny},
+        cline/.style={rectangle, draw, thick, minimum width=9.6cm, minimum height=0.5cm, align=left, font=\footnotesize, inner xsep=3pt},
+        arrow/.style={->,thick,>=stealth}
+    ]
+    % T-table entries (show 256 entries grouped into 16 cache lines)
+    \node[font=\small\bfseries] at (5,3.5) {$Te_0$表结构（256项$\times$4字节=1024字节）};
+
+    % Show first 3 cache lines in detail, then dots, then last
+    \foreach \row/\start/\end/\col/\lbl in {
+        0/0x00/0x0F/blue!15/第0缓存行（监控目标）,
+        1/0x10/0x1F/white/第1缓存行,
+        2/0x20/0x2F/white/第2缓存行%
+    } {
+        \node[cline,fill=\col] (cl\row) at (5,2.5-\row*0.6) {\lbl：索引\start{}--\end{}};
+    }
+    \node at (5,0.5) {$\vdots$};
+    \node[cline] (cl15) at (5,0) {第15缓存行：索引0xF0--0xFF};
+
+    % Highlight monitored cache line
+    \draw[red,very thick,rounded corners] ([xshift=-2pt,yshift=-2pt]cl0.south west) rectangle ([xshift=2pt,yshift=2pt]cl0.north east);
+    \node[font=\footnotesize,text=red] at (10.5,2.5) {$\longleftarrow$ 攻击者监控};
+
+    % Address structure
+    \node[font=\small\bfseries] at (5,-1) {索引地址结构};
+    \draw[thick] (0.5,-1.5) rectangle (5.5,-2.2);
+    \node[font=\footnotesize] at (3,-1.85) {8位索引};
+    \draw[thick,dashed,red] (0.5,-1.5) rectangle (2.5,-2.2);
+    \node[font=\tiny,text=red] at (1.5,-1.85) {高4位};
+    \draw[thick,dashed,blue] (2.5,-1.5) rectangle (5.5,-2.2);
+    \node[font=\tiny,text=blue] at (4,-1.85) {低4位};
+
+    \node[font=\tiny,text=red,anchor=west] at (5.8,-1.85) {高4位$\to$缓存行号（0--15）};
+
+    % 4 T-tables
+    \node[font=\small\bfseries] at (5,-3) {4张T表共64个缓存行};
+    \foreach \i/\lbl in {0/$Te_0$, 1/$Te_1$, 2/$Te_2$, 3/$Te_3$} {
+        \node[rectangle, draw, thick, fill=green!10, minimum width=1.8cm, minimum height=0.6cm, font=\footnotesize] (te\i) at (\i*2.5+0.5,-3.7) {\lbl};
+        \node[font=\tiny,below] at (\i*2.5+0.5,-4) {16个缓存行};
+    }
+    \end{tikzpicture}
+    \caption{AES T表结构与缓存行映射关系。每个T表含256个32位表项，共1024字节，按每16项一组划分为16个缓存行。索引的高4位决定缓存行号。攻击者仅监控每张T表的第0号缓存行（红色标注），共4个监控点}
+    \label{fig:ttable_cache_mapping}
+\end{figure}
+
+\begin{equation}
+CacheLine(T_i[x]) = \lfloor x / 16 \rfloor = x >> 4
+\end{equation}
+
+攻击者以缓存行为单位监视T表访问，每次即可获取索引的高4位——即4比特信息。攻击者观察到对某个缓存行的访问，即可将查表索引的高4位信息确定下来。4张T表共64个缓存行，本文通常仅监控每张表的第0号缓存行（对应索引0-15），共4个监控点。该策略降低了clflush开销和测量噪声，同时利用排除法仍可逐步收敛到正确密钥。
+
+基于查找表的AES实现是缓存侧信道攻击的核心目标，攻击目标是融合了MixColumns的$Te$表，OpenSSL、Libgcrypt等主流密码库均采用T表优化，大量已部署软件面临侧信道风险。替代方案有位切片（Bitsliced）实现：将多个数据块打包到SIMD寄存器中并行处理，直接去除查表操作，从源头切断缓存侧信道的条件。但位切片需同时处理多个数据块，单块加密场景无法使用。
+
+\section{Flush+Reload攻击原理}
+
+\subsection{攻击模型}
+
+Flush+Reload攻击的成立需要满足若干前提：第一，探测方和被攻击方必须共享内存——双方映射同一块物理内存，缓存状态才能共享，时间测量才能反映被攻击方的行为。第二，探测方需能执行CLFLUSH指令。这是x86的缓存行逐出指令。第三，需要高精度时间测量，依赖RDTSC/RDTSCP。最后，探测方需要知道共享内存中目标数据的地址布局——如T表的偏移量。在动态库场景下，加载同一库即可计算偏移；自定义共享内存场景下，偏移量可自行确定。
+
+\subsection{攻击流程}
+
+Flush+Reload攻击的核心是一个四步循环。
+
+\begin{figure}[htbp]
+    \centering
+    \includegraphics[width=0.35\textwidth]{Flush+Reload攻击四步循环流程图.png}
+    \caption{Flush+Reload攻击的四步循环流程图。攻击者通过反复执行刷新（Flush）→等待（Wait）→重载（Reload）→推断（Infer）的循环，收集缓存访问模式的统计信息，最终推断出受害者的密钥信息}
+    \label{fig:flush_reload_flow}
+\end{figure}
+
+第1步：刷新（Flush）——CLFLUSH将目标缓存行从所有缓存级别中逐出。CLFLUSH触发MESI协议的无效化操作，目标行在所有缓存层级均置为I。在包含性缓存层次中，L3中的副本也被清除。
+
+第2步：等待（Wait）——等待被攻击方执行。若被攻击方访问了被刷新的地址，数据将进入Victim进程的L1/L2和共享L3，该行在L3中处于Shared状态。若未访问，缓存行仍为I。
+
+第3步：重载（Reload）——重新访问目标地址，测量时间。数据在L3（被攻击方访问过）就约40-80周期（命中）；不在任何缓存（没访问过）就约200-400周期（未命中）。
+
+第4步：推断（Infer）——根据缓存状态推测被攻击方的行为。时间低于阈值T，判为命中，说明被攻击方访问了目标缓存行。高于阈值判为未命中。
+
+四步反复循环，累积足够样本即可推断出访问模式，进而恢复密钥等敏感信息。
+
+每次循环的时间开销主要取决于等待阶段，攻击者需要等受害者完成一次完整的加密操作。在同步攻击（攻击者触发受害者加密）中，等待时间可以精确控制；在异步攻击中，等待时间不确定，需要通过多次采样来补偿。
+
+\subsection{Flush+Flush变体}
+
+Gruss等人提出的Flush+Flush是Flush+Reload的变体。它不测量数据访问时间，而是测量CLFLUSH指令本身的执行时间。其原理在于：目标缓存行若在缓存中（脏或干净），CLFLUSH需执行无效化操作，耗时长（约200周期）；若不在缓存中，CLFLUSH几乎无需操作，耗时很短（约40周期）。
+
+Flush+Flush与Flush+Reload相比有几个值得注意的差异。它不需要实际访问目标数据，从而避开了数据访问可能触发的异常和审计，降低了被检测的风险。它也不改变缓存状态——CLFLUSH之后缓存行确实被逐出了，但探测方不重载，不在缓存中留下自身的访问痕迹。但也存在代价：CLFLUSH的执行时间差异通常小于Flush+Reload的访问时间差异（在典型Intel平台上约160周期 vs Flush+Reload的200+周期），信噪比稍低，但该差值因微架构和内存状态而异，不同平台可能接近或超过100周期；而且CLFLUSH会破坏缓存状态，可能影响Victim进程的性能。
+
+\subsection{与其他缓存攻击方法的比较}
+
+缓存侧信道攻击有多种实现方法，Flush+Reload仅为其中之一。下面对比三种主要方法。
+
+Prime+Probe：探测方先用自身数据填满目标缓存组（Prime），等待被攻击方执行，再重新访问自身数据、测量时间（Probe）。若被攻击方访问了同一缓存组，驱逐了探测方的数据，Probe阶段即可发现缓存未命中。Prime+Probe无需共享内存、也无需CLFLUSH，适用面更广。局限在于精度低（组级别分辨率，而非缓存行级别），噪声也更大——探测方自身的数据可能被其他进程驱逐。Liu等人在跨VM场景下验证了Prime+Probe攻击LLC的可行性。
+
+Evict+Time：探测方先通过大量访存将目标数据从缓存中驱逐（Evict），再触发被攻击方加密、测量总执行时间（Time）。被驱逐的数据若在加密中被重新加载，总执行时间将增大。Evict+Time无需共享内存，但精度最差：仅能测量整次加密的总时间，无法定位具体哪个缓存行被访问。此外Evict+Time需要能够触发被攻击方的加密操作。
+
+三种方法的比较如表\ref{tab:attack_comparison}所示。
+
+\begin{table}[htbp]
+\centering
+\caption{三种缓存侧信道攻击方法比较}
+\label{tab:attack_comparison}
+\begin{tabular}{lccc}
+\hline
+特性 & Flush+Reload & Prime+Probe & Evict+Time \\
+\hline
+共享内存要求 & 需要 & 不需要 & 不需要 \\
+CLFLUSH要求 & 需要 & 不需要 & 不需要 \\
+空间分辨率 & 缓存行 & 缓存组 & 整体 \\
+噪声水平 & 低 & 中 & 高 \\
+跨核心能力 & 有 & 有 & 有限 \\
+隐蔽性 & 较低 & 中 & 较高 \\
+\hline
+\end{tabular}
+\end{table}
+
+\section{缓解措施概述}
+
+针对Flush+Reload这类缓存侧信道攻击，研究者提出了多种缓解思路，大致可分为软件和硬件两个层面。王崇等人对缓存侧信道防御技术做了系统梳理，从攻击模型角度对现有防御措施做了分类比较。
+
+\subsection{软件层面缓解}
+
+缓存刷新（Cache Flushing）：执行敏感操作后，主动用CLFLUSH刷新相关缓存行，清除缓存状态中的信息残留。实现简单，性能开销却很明显——单次CLFLUSH的延迟约40--200周期，每次加密后刷新所有T表缓存行（64个）的总开销在2500--10000周期级别。仅刷新4个监控缓存行（每张T表的第0号缓存行）时，性能下降约5.7\%；若刷新全部64个缓存行，开销将更为显著。此外还有一个问题：缓存刷新只能清除操作之后的痕迹，操作中的信息泄露无法阻止。
+
+噪声注入（Noise Injection）：在敏感操作前后插入随机延迟或随机访存，干扰时间测量。随机延迟是在加密前后引入$rand() \mod T_{max}$周期的空循环。随机访存是以一定概率读取T表监控缓存行来引入假阳性噪声。本实验设置了三种噪声强度：低噪声（30\%访问概率）、中噪声（40\%访问概率）、高噪声（50\%访问概率）。噪声注入的性能代价取决于强度：低噪声对性能影响较小，但防护效果有限；高噪声能明显降低攻击成功率，但性能损失也更大。噪声注入的局限是概率性的——探测方可以通过累积样本量来消除噪声影响。
+
+核心绑定（Core Pinning）：sched\_setaffinity将敏感进程绑定在特定核心上，减少跨核心缓存共享的机会。但核心绑定只能阻止监听方利用共享L3进行跨核攻击，同核攻击无法阻止（双方运行于同一核心的超线程上）。多租户云环境中，核心绑定还面临资源分配的难题：为每个安全域独占核心，资源利用率将大幅下降。
+
+缓存无关实现（Cache-Oblivious Implementation）：设计不依赖缓存状态的算法实现，如AES的位切片方案。位切片将多个数据块打包到SIMD寄存器中并行处理，不使用查表操作，从源头上切断了缓存侧信道攻击的条件。局限在于位切片需同时处理多个数据块（通常为8块甚至更多），单块加密无法使用；实现复杂度也远高于T表方案。
+
+\subsection{硬件层面缓解}
+
+Intel CAT（Cache Allocation Technology）：允许OS将LLC的缓存路划分为多个分区，不同安全域的进程使用不同分区，实现缓存隔离。例如，12路组相联的LLC，0-5路划给安全域A，6-11路划给安全域B，两个域的缓存访问互不干扰。CAT的优势在于硬件级隔离，性能代价低。局限也明显：分区粒度粗（以路为单位），可用路数有限，分区数量增多时每个分区的缓存容量不足。Wang和Lee较早提出了基于缓存分区的防御思路，Intel CAT可视为该思路的工程落地。
+
+STEALTHMEM：Kim等人研究的STEALTHMEM系统，在OS层面为敏感数据分配专用缓存行，其他进程无法使用这些缓存行。具体方法是修改页面着色策略，确保敏感页面映射到专用缓存组，其他进程的页面不会映射到同一组。实验表明STEALTHMEM能有效抵御Prime+Probe和Flush+Reload攻击。缺点是需要修改OS内核，部署成本高。
+
+ARM缓存分区与内存标签：ARM架构提供了多种硬件隔离机制。ARMv8-A的缓存分区特性（如MPAM，Memory System Resource Partitioning and Monitoring）允许系统软件将缓存路划分给不同安全域，实现类似Intel CAT的缓存隔离效果。ARMv8.5-A引入的内存标签扩展（MTE）为内存访问添加标签检查，能检测越界访问，间接增加侧信道攻击的复杂度。此外，ARMv8.3-A的指针认证代码（PAC）主要用于防御控制流劫持，与缓存侧信道无直接关系，但其密码学认证机制可作为纵深防御的一环。
+
+随机化缓存架构：Wang和Lee提出的随机化缓存架构（New Cache Designs），在缓存索引计算中引入密钥相关的随机化，使探测方无法预知目标数据映射到哪个缓存组。该方案需要修改处理器微架构，部署周期长，但从根本上破坏了缓存攻击的地址可预测性前提。
+
+现有的缓解措施各有局限性，尚无单一方案能够消除缓存侧信道风险。实际部署需组合多种措施，在安全性和性能之间寻求平衡。张伟娟等人对缓存侧信道攻防最新进展做了系统总结，第四章将对几种软件层面的缓解措施进行量化评估，比较防护效果和性能开销。
+
+\section{本章小结}
+
+本章聚焦从硬件到防御的原理，阐述了Flush+Reload探测所需的技术背景。
+
+硬件层面覆盖了CPU缓存的分层结构、寻址方式、替换策略和包含性关系，以及MESI一致性协议使跨核攻击成为可能的原因。共享内存部分介绍了POSIX API、写时复制机制、虚拟化环境中KSM内存去重带来的安全风险。测量层面讨论了RDTSC和RDTSCP的差异、用户态测量面临的各种噪声来源、中位数阈值方法的原理。算法层面从AES的有限域数学基础出发，阐述了四个轮函数、密钥扩展的递归规律，T表加速实现及其缓存侧信道漏洞。攻击层面展开了Flush+Reload的四步循环、Flush+Flush变体，并与Prime+Probe和Evict+Time进行了对比。防御层面概述了缓存刷新、噪声注入、核心绑定、缓存无关实现等软件方案，以及CAT、STEALTHMEM、随机化缓存等硬件方案的基本思路和适用场景。
+
+下一章将给出具体搭建的实验环境和实现方案。

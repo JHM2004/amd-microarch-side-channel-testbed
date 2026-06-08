@@ -1,0 +1,34 @@
+\infowidth{8cm}
+
+\cheading{天津大学 2026 届本科生毕业论文}
+\ctitle{处理器微架构侧信道漏洞安全测试技术研究}
+\caffil{智能与计算学部}
+\csubject{软件工程}
+\cgrade{2022级}
+\cauthor{杨宇鑫}
+\cnumber{3022207128}
+\csupervisor{鲁赵骏}
+
+\cabstractcn{
+    云计算和多租户虚拟化的大范围部署，使微架构侧信道漏洞成为信息安全领域的重要威胁。高速缓存、分支预测、乱序执行、预取等硬件优化在提升计算速度的同时，亦留下了可被观测的时间差、功耗波动和资源竞争模式，攻击者无需越过权限边界即可从这些物理旁路中推断密钥、明文等受保护数据。本文以AES加密算法的Flush+Reload缓存侧信道攻击为研究对象，围绕微架构侧信道漏洞的安全测试技术展开研究。
+
+    论文工作分三个层次展开：理论层梳理了Flush+Reload攻击的底层机制，包括CPU缓存层次、共享内存与页面去重、高精度时间戳测量等支撑技术；设计实现层搭建了一套统一处理AES-128/192/256三种密钥长度的攻击框架，通过Flush+Reload配合排除法完成末轮子密钥恢复，对于AES-192和AES-256，进一步借助加密T表的监控信息推导倒数第二轮子密钥，经密钥扩展逆运算反解出原始密钥；评估层通过对命中率、泄露带宽等统计量的测量来度量攻击效果。
+
+    实验在Linux平台上对随机噪声注入和缓存行刷新两种防御手段进行了对照测试，数据表明缓存刷新在阻断信息泄露方面最为彻底，能从根源上消除侧信道泄露通路。研究成果为微架构侧信道安全测试提供了可落地的方法论和工具支撑，可用于云平台风险评估与安全审计。
+}
+
+\ckeywordcn{
+    微架构侧信道；Flush+Reload攻击；AES加密；缓存攻击；安全测试；信息泄露
+}
+
+\cabstracten{
+    With the proliferation of cloud computing and multi-tenant virtualization environments, processor microarchitectural side-channel vulnerabilities have become a major threat in the field of information security. These vulnerabilities stem from timing differences introduced by microarchitectural mechanisms---such as caches, branch prediction, and out-of-order execution that improve performance but can be observed, allowing an attacker to infer sensitive information without directly violating privilege boundaries. This thesis focuses on the Flush and Reload cache side-channel attack against the AES encryption algorithm and systematically investigates security testing techniques for microarchitectural side-channel vulnerabilities.
+
+    The thesis work proceeds at three levels: at the theoretical level, an in-depth analysis of the fundamental principles of the Flush+Reload attack is provided, covering key technical foundations including CPU cache structure, shared memory mechanisms, and timing measurement methods; at the design and implementation level, a unified attack framework supporting three key lengths---AES-128, AES-192, and AES-256---is constructed, which adopts Flush+Reload combined with an elimination method to recover the last round key, and for AES-192 and AES-256, further recovers the penultimate round key by reusing the encryption T-table monitoring data and then reconstructs the original key through the reverse key expansion process; at the evaluation level, a comprehensive quantitative metric system incorporating hit rate, leakage bandwidth, and attack success rate is established to assess attack effectiveness.
+
+    Experiments conducted under a Linux environment systematically evaluate two common defense measures---random noise injection and cache flushing---with results demonstrating that cache flushing is the most effective defense measure, eliminating the side-channel leakage path at its root. The research outcomes provide methodological and tool support for security testing of processor microarchitectural side-channel vulnerabilities, and offer reference value for cloud platform security assessment and security auditing.
+}
+
+\ckeyworden{
+    Microarchitectural Side Channel；Flush+Reload Attack；AES Encryption；Cache Attack；Security Testing；Information Leakage
+}

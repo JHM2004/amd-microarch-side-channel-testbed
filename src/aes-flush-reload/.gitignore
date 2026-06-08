@@ -1,0 +1,37 @@
+# 编译生成的可执行文件和运行结果
+build/
+results/
+
+# 目标文件
+*.o
+*.obj
+
+# 调试文件
+*.dSYM/
+*.su
+*.idb
+*.pdb
+
+# IDE 配置文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 临时文件
+*.tmp
+*.temp
+*.log
+
+# 核心转储文件
+core
+core.*
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 备份文件
+*.bak
+*.backup
